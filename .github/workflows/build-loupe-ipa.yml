@@ -1,0 +1,189 @@
+name: Build Loupe IPA
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+
+    steps:
+      # ── 1. Checkout the Loupe Swift source ────────────────────────────────
+      - name: Checkout Loupe repository
+        uses: actions/checkout@v4
+        with:
+          repository: mysk-research/loupe
+          ref: main
+
+      # ── 2. Select Xcode version ───────────────────────────────────────────
+      - name: Select Xcode 16
+        run: sudo xcode-select -s /Applications/Xcode_16.app
+
+      # ── 3. Import your Apple signing certificate into a temp keychain ─────
+      #
+      #   Secret: SIGNING_CERT_BASE64
+      #     How to get it:
+      #       1. Open Keychain Access on your Mac
+      #       2. Find your "Apple Distribution: ..." certificate
+      #       3. Right-click → Export → save as .p12 (set a password)
+      #       4. Run: base64 -i MyCert.p12 | pbcopy
+      #       5. Paste the result as this secret
+      #
+      #   Secret: SIGNING_CERT_PASSWORD
+      #     The password you set when exporting the .p12 above
+      #
+      - name: Import signing certificate
+        env:
+          SIGNING_CERT_BASE64: ${{ secrets.SIGNING_CERT_BASE64 }}
+          SIGNING_CERT_PASSWORD: ${{ secrets.SIGNING_CERT_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          KEYCHAIN_PATH=$RUNNER_TEMP/build.keychain
+
+          # Create a temporary keychain
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Decode and import the certificate
+          echo "$SIGNING_CERT_BASE64" | base64 --decode > $RUNNER_TEMP/cert.p12
+          security import $RUNNER_TEMP/cert.p12 \
+            -k "$KEYCHAIN_PATH" \
+            -P "$SIGNING_CERT_PASSWORD" \
+            -A -t cert -f pkcs12
+
+          # Make the keychain available to codesign
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+
+      # ── 4. Install your provisioning profile ──────────────────────────────
+      #
+      #   Secret: PROVISIONING_PROFILE_BASE64
+      #     How to get it:
+      #       1. Go to developer.apple.com → Certificates, IDs & Profiles
+      #       2. Create a new Distribution provisioning profile for your App ID
+      #       3. Download the .mobileprovision file
+      #       4. Run: base64 -i Loupe.mobileprovision | pbcopy
+      #       5. Paste the result as this secret
+      #
+      - name: Install provisioning profile
+        env:
+          PROVISIONING_PROFILE_BASE64: ${{ secrets.PROVISIONING_PROFILE_BASE64 }}
+        run: |
+          PP_PATH=$RUNNER_TEMP/loupe.mobileprovision
+          echo "$PROVISIONING_PROFILE_BASE64" | base64 --decode > "$PP_PATH"
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          cp "$PP_PATH" ~/Library/MobileDevice/Provisioning\ Profiles/
+
+      # ── 5. Resolve Swift Package dependencies ─────────────────────────────
+      - name: Resolve Swift Package dependencies
+        run: |
+          xcodebuild -resolvePackageDependencies \
+            -scheme Loupe \
+            -project code/Loupe.xcodeproj
+
+      # ── 6. Build the .xcarchive ───────────────────────────────────────────
+      #
+      #   Secret: DEVELOPMENT_TEAM
+      #     Your Apple Developer Team ID — find it at:
+      #     developer.apple.com → Account → Membership → Team ID
+      #     Looks like: AB12CD34EF
+      #
+      - name: Archive
+        env:
+          DEVELOPMENT_TEAM: ${{ secrets.DEVELOPMENT_TEAM }}
+        run: |
+          xcodebuild archive \
+            -scheme Loupe \
+            -project code/Loupe.xcodeproj \
+            -configuration Release \
+            -archivePath $RUNNER_TEMP/Loupe.xcarchive \
+            -destination "generic/platform=iOS" \
+            DEVELOPMENT_TEAM="$DEVELOPMENT_TEAM" \
+            CODE_SIGN_STYLE=Manual \
+            | xcpretty
+
+      # ── 7. Export the .ipa ────────────────────────────────────────────────
+      #
+      #   This step uses ExportOptions.plist (created below) to package
+      #   the archive into a distributable .ipa file.
+      #
+      #   Secret: BUNDLE_ID
+      #     Your app's Bundle Identifier, e.g.: com.yourname.loupe
+      #     Must match what you registered in the Apple Developer portal.
+      #
+      - name: Create ExportOptions.plist
+        env:
+          DEVELOPMENT_TEAM: ${{ secrets.DEVELOPMENT_TEAM }}
+          BUNDLE_ID: ${{ secrets.BUNDLE_ID }}
+        run: |
+          cat > $RUNNER_TEMP/ExportOptions.plist << EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>app-store-connect</string>
+            <key>teamID</key>
+            <string>${DEVELOPMENT_TEAM}</string>
+            <key>provisioningProfiles</key>
+            <dict>
+              <key>${BUNDLE_ID}</key>
+              <string>Loupe Distribution</string>
+            </dict>
+            <key>signingStyle</key>
+            <string>manual</string>
+            <key>stripSwiftSymbols</key>
+            <true/>
+            <key>uploadBitcode</key>
+            <false/>
+            <key>compileBitcode</key>
+            <false/>
+          </dict>
+          </plist>
+          EOF
+
+      - name: Export IPA
+        run: |
+          xcodebuild -exportArchive \
+            -archivePath $RUNNER_TEMP/Loupe.xcarchive \
+            -exportPath $RUNNER_TEMP/output \
+            -exportOptionsPlist $RUNNER_TEMP/ExportOptions.plist \
+            | xcpretty
+
+      # ── 8. Upload the .ipa as a downloadable artifact ────────────────────
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Loupe-${{ github.run_number }}.ipa
+          path: ${{ runner.temp }}/output/*.ipa
+          retention-days: 30
+
+      # ── 9. (Optional) Upload to TestFlight ───────────────────────────────
+      #   Uncomment this block to send the build directly to TestFlight.
+      #
+      #   Secrets needed:
+      #     APP_STORE_CONNECT_KEY_ID      — API key ID from App Store Connect
+      #     APP_STORE_CONNECT_ISSUER_ID   — Issuer ID from App Store Connect
+      #     APP_STORE_CONNECT_KEY_BASE64  — .p8 private key file, base64-encoded
+      #
+      # - name: Upload to TestFlight
+      #   env:
+      #     ASC_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+      #     ASC_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+      #     ASC_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_KEY_BASE64 }}
+      #   run: |
+      #     echo "$ASC_KEY_BASE64" | base64 --decode > /tmp/asc_key.p8
+      #     xcrun altool --upload-app \
+      #       --type ios \
+      #       --file $RUNNER_TEMP/output/*.ipa \
+      #       --apiKey "$ASC_KEY_ID" \
+      #       --apiIssuer "$ASC_ISSUER_ID" \
+      #       --private-key /tmp/asc_key.p8
+
+      # ── 10. Clean up keychain ─────────────────────────────────────────────
+      - name: Clean up keychain
+        if: always()
+        run: |
+          security delete-keychain $RUNNER_TEMP/build.keychain || true
